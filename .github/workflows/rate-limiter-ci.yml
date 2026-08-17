@@ -1,0 +1,81 @@
+name: Rate Limiter CI
+
+on:
+  push:
+    paths:
+      - '01-rate-limiter/**'
+  pull_request:
+    paths:
+      - '01-rate-limiter/**'
+
+defaults:
+  run:
+    working-directory: 01-rate-limiter
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run unit tests (mocked Redis, no dependency)
+        run: pytest test_limiter.py -v
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run Lua script integration tests
+        run: pytest test_token_bucket_integration.py -v
+      - name: Run concurrency race-condition test
+        run: pytest test_concurrency.py -v
+      - name: Run FastAPI end-to-end tests
+        run: pytest test_app.py -v
+
+  fr4-shared-limit-check:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start multi-instance stack
+        run: docker compose up -d --build
+      - name: Wait for stack to be healthy
+        run: |
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8080/health && break
+            sleep 2
+          done
+      - name: Verify shared limit across app instances
+        run: bash scripts/verify_shared_limit.sh
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan dependencies for known CVEs
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: 01-rate-limiter/Dockerfile
